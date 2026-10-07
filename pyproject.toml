@@ -1,7 +1,7 @@
 [project]
 name = "google-books-tw-mcp"
-version = "1.0.0"
-description = "針對臺灣繁體出版品、ISBN 破折號自動清洗、高畫質書封解析的專用 Google Books MCP 伺服器"
+version = "1.1.0"
+description = "專為臺灣繁體出版品市場打造的書目元資料解析與事實層 (Taiwan Book Metadata Resolver) MCP 伺服器"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

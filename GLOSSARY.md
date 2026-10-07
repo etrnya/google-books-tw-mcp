@@ -1,6 +1,6 @@
-# 📖 Google Books TW MCP 專案術語字典 (Glossary) v1.0.0
+# 📖 Google Books TW MCP 專案術語字典 (Glossary) v1.1.0
 
-> 本文件依據全域開發通則「字典先行 (Dictionary First)」原則建立，嚴格定義 `google-books-tw-mcp`（臺灣繁體出版品 Google Books MCP 伺服器）之專業術語、資料模型與變數命名規範。所有程式碼與文檔必須 100% 對齊本字典。
+> 本文件依據全域開發通則「字典先行 (Dictionary First)」原則建立，嚴格定義 `google-books-tw-mcp`（臺灣書目元資料解析伺服器 Taiwan Book Metadata Resolver）之專業術語、資料模型與變數命名規範。所有程式碼與文檔必須 100% 對齊本字典。
 
 ---
 
@@ -8,33 +8,58 @@
 
 | 繁體中文術語 | 英文對照 (Term) | 代碼變數 / 識別碼 (Identifier) | 定義與語義解釋 |
 | :--- | :--- | :--- | :--- |
-| **國際標準書號 (13碼)** | International Standard Book Number 13 | `isbn_13` | 13 碼標準書籍識別碼（978 開頭），由數字組成，無破折號。 |
-| **國際標準書號 (10碼)** | International Standard Book Number 10 | `isbn_10` | 10 碼舊版書籍識別碼，最後一碼可能為 'X'。 |
-| **正規化 ISBN** | Normalized ISBN | `normalized_isbn` | 清除所有破折號 (`-`)、空格後的大寫標準純數字字串。 |
-| **高解析度書封網址** | High-Resolution Cover URL | `highres_cover_url` | 經本伺服器特殊演算法還原之官方原尺寸高清書籍封面圖連結（強制 `https` 且 `zoom=0`）。 |
-| **書籍出版元資料** | Book Volume Metadata | `book_metadata` / `VolumeMetadata` | 包含標準書名、副標題、作者列表、出版社、出版日期、ISBN、頁數與書封的結構化物件。 |
-| **模型上下文協定** | Model Context Protocol | `mcp` | 由 Anthropic 開源之 AI 工具調用標準通信協定。 |
-| **繁中書目搜尋工具** | Search Books Tool | `search_books` | 針對臺灣出版品關鍵字（書名、作者、出版社）檢索之 MCP 工具。 |
-| **ISBN 精確檢索工具** | Get Book By ISBN Tool | `get_book_by_isbn` | 輸入條碼數字精確定位單一書籍出版版本之 MCP 工具。 |
-| **封面提取專用工具** | Get Book Cover Tool | `get_book_cover` | 單獨提取高畫質書封 URL 之輕量 MCP 工具。 |
+| **書目元資料解析器** | Taiwan Book Metadata Resolver | `metadata_resolver` | 本專案核心定位：自外部資料源提煉、清洗、驗證並生成事實層 (Fact Layer) 之結構化服務。 |
+| **版本識別身分** | Edition Identity | `edition_identity` / `identity` | 由 `isbn_13`、`isbn_10` 與 `google_books_id` 組成之唯一身分識別集合。 |
+| **作品創作層** | Book Work Layer | `work` | 書籍作品本體（書名 `title`、副標題 `subtitle`、作者列表 `authors`、語言 `language`）。 |
+| **出版版本層** | Book Edition Layer | `edition` | 具體出版交易實體屬性（出版社 `publisher`、出版日期 `published_date`、頁數 `page_count`、裝訂形式 `print_type`）。 |
+| **書封解析結果** | Cover Resolution | `cover` | 包含 `url`、`resolution_hint` ("high" / "medium")、`source` 之封面結構物件。 |
+| **資料溯源與可信度** | Source & Confidence | `source` | 包含資料來源提供者 `provider`、信心度分數 `confidence` (0.0~1.0) 與 `confidence_reasons` 判定依據陣列。 |
+| **ISBN 數學校驗** | ISBN Mathematical Validation | `isbn_validation` | 依據模數 11（ISBN-10）與模數 10（ISBN-13）演算法計算校驗碼，判定號碼真實性與完整性。 |
+| **一站式書目解析工具** | Resolve Book Tool | `resolve_book` | 一鍵輸入 ISBN 或書名，自動完成清洗、校驗、檢索、升級書封與信心評分之核心 MCP 工具。 |
 
 ---
 
 ## 2. 結構化資料模型 (Data Schema)
 
-### 2.1 書籍元資料實體 (`TaiwanBookInfo`)
+### 2.1 書目事實解析實體 (`ResolvedBookFact`)
 ```python
-class TaiwanBookInfo:
-    title: str                  # 正書名 (如: "原子習慣")
-    subtitle: str | None        # 副標題 (如: "細微改變帶來巨大成就的實證法則")
-    authors: list[str]          # 作者列表 (如: ["James Clear"])
-    publisher: str | None       # 出版社 (如: "方智")
-    published_date: str | None  # 出版日期 (如: "2019-06-01")
-    isbn_13: str | None         # 標準 13 碼 ISBN
-    isbn_10: str | None         # 標準 10 碼 ISBN
-    page_count: int | None      # 總頁數
-    language: str               # 語言代碼 (如: "zh-TW")
-    cover_url: str | None       # 高畫質書封圖網址
-    description: str | None     # 書籍內容簡介 (精簡版)
-    google_books_id: str        # Google Books 系統專屬 Volume ID
+class ResolvedBookFact:
+    success: bool
+    identity: {
+        "isbn_13": str | None,
+        "isbn_10": str | None,
+        "google_books_id": str | None
+    }
+    work: {
+        "title": str,
+        "subtitle": str | None,
+        "authors": list[str],
+        "language": str
+    }
+    edition: {
+        "publisher": str | None,
+        "published_date": str | None,
+        "page_count": int | None,
+        "print_type": str
+    }
+    cover: {
+        "url": str | None,
+        "resolution_hint": "high" | "medium" | "none",
+        "source": str
+    }
+    source: {
+        "provider": str,               # 如 "google_books"
+        "confidence": float,           # 0.0 ~ 1.0
+        "confidence_reasons": list[str], # 如 ["exact_isbn13_checksum_passed", "taiwan_publisher_match"]
+        "retrieved_at": str            # ISO 8601 時間戳
+    }
+```
+
+### 2.2 標準錯誤協定 (`McpErrorResponse`)
+```python
+class McpErrorResponse:
+    success: bool = False
+    error: "INVALID_ISBN" | "NOT_FOUND" | "RATE_LIMITED" | "UPSTREAM_TIMEOUT" | "UPSTREAM_5XX" | "INVALID_RESPONSE"
+    message: str
+    retryable: bool
 ```
