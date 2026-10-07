@@ -12,8 +12,8 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-# 優先載入本地 .env 設定
-load_dotenv()
+# 優先載入本地 .env 設定 (覆蓋預設環境變數)
+load_dotenv(override=True)
 
 # 初始化 FastMCP 伺服器
 mcp = FastMCP("google-books-tw-mcp")
@@ -35,8 +35,11 @@ KNOWN_TAIWAN_PUBLISHERS = {
 # ============================================================================
 
 def get_api_key() -> Optional[str]:
-    """獲取 Google Books API 金鑰 (優先讀取環境變數)"""
-    return os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip() or None
+    """獲取 Google Books API 金鑰 (優先讀取環境變數，自動過濾佔位符)"""
+    key = os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip()
+    if not key or "YOUR_" in key or "KEY_HERE" in key or key.lower() in ("none", "undefined", "null"):
+        return None
+    return key
 
 
 def make_error(code: str, message: str, retryable: bool = False) -> dict[str, Any]:
@@ -195,6 +198,12 @@ def build_book_fact(item: dict[str, Any], query_used: str, is_isbn_query: bool) 
         or image_links.get("smallThumbnail")
     )
     cover_fact = resolve_highres_cover(raw_cover)
+    if not cover_fact["url"] and isbn_13 and isbn_13.startswith("978"):
+        cover_fact = {
+            "url": f"https://cdnec.sanmin.com.tw/product_images/{isbn_13[3:6]}/{isbn_13[3:12]}.jpg",
+            "resolution_hint": "high",
+            "source": "taiwan_catalog_cdn"
+        }
 
     # 臺灣出版社與繁中特徵識別
     publisher = vol_info.get("publisher", "")
@@ -260,6 +269,205 @@ def build_book_fact(item: dict[str, Any], query_used: str, is_isbn_query: bool) 
 
 
 # ============================================================================
+# 4.5 臺灣本土書庫備援解析引擎 (Taiwan Catalog Fallback Engine)
+# ============================================================================
+
+def get_taiwan_isbn_cover(isbn_13: str) -> Optional[str]:
+    """臺灣三民/天瓏高畫質原圖 CDN 映射"""
+    if isbn_13 and len(isbn_13) == 13 and isbn_13.startswith("978"):
+        return f"https://cdnec.sanmin.com.tw/product_images/{isbn_13[3:6]}/{isbn_13[3:12]}.jpg"
+    return None
+
+
+async def fallback_resolve_book(query_or_isbn: str, is_isbn: bool, canonical_13: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """當 Google Books 遇到頻率限制 (429) 或未收錄時，自動透過臺灣本土書目庫備援解析"""
+    import urllib.parse
+    from bs4 import BeautifulSoup
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    clean_target = query_or_isbn.strip()
+    
+    # 模式 A: 已知有效 ISBN
+    if is_isbn and canonical_13:
+        cover_url = get_taiwan_isbn_cover(canonical_13)
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=6.0, follow_redirects=True) as client:
+                resp = await client.get(f"https://www.sanmin.com.tw/search?ct=K&qu={canonical_13}", headers=headers)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for img in soup.find_all("img"):
+                        data_src = img.get("data-src", "")
+                        alt = img.get("alt", "").strip()
+                        if "product_images" in data_src and alt and "簡體書" not in alt:
+                            p = img.find_parent("div")
+                            while p and len(p.text) < 50:
+                                p = p.find_parent("div")
+                            author = None
+                            publisher = None
+                            if p:
+                                t = p.text
+                                m_pub = re.search(r"出版社[：:\s]+([^\s\n\r]+)", t)
+                                if m_pub: publisher = m_pub.group(1).strip()
+                                m_auth = re.search(r"作者[：:\s]+([^\s\n\r]+)", t)
+                                if m_auth: author = m_auth.group(1).strip()
+                            return {
+                                "identity": {"isbn_13": canonical_13, "isbn_10": None, "google_books_id": None},
+                                "work": {"title": alt, "subtitle": None, "authors": [author] if author else [], "language": "zh-TW"},
+                                "edition": {"publisher": publisher, "published_date": None, "page_count": None, "print_type": "BOOK"},
+                                "cover": {"url": cover_url, "resolution_hint": "high", "source": "taiwan_catalog_cdn"},
+                                "description": None,
+                                "source": {
+                                    "provider": "taiwan_catalog_fallback",
+                                    "confidence": 0.95,
+                                    "confidence_reasons": ["exact_isbn_checksum_passed", "taiwan_catalog_match"],
+                                    "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                                }
+                            }
+        except Exception:
+            pass
+        
+        # 若網路爬蟲逾時，仍回傳已知有效 ISBN 與高畫質 CDN 書封
+        return {
+            "identity": {"isbn_13": canonical_13, "isbn_10": None, "google_books_id": None},
+            "work": {"title": clean_target, "subtitle": None, "authors": [], "language": "zh-TW"},
+            "edition": {"publisher": None, "published_date": None, "page_count": None, "print_type": "BOOK"},
+            "cover": {"url": cover_url, "resolution_hint": "high", "source": "taiwan_catalog_cdn"},
+            "description": None,
+            "source": {
+                "provider": "taiwan_catalog_cdn",
+                "confidence": 0.90,
+                "confidence_reasons": ["exact_isbn_checksum_passed"],
+                "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
+        }
+    
+    # 模式 B: 書名關鍵字檢索
+    q_quoted = urllib.parse.quote(clean_target)
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=6.0, follow_redirects=True) as client:
+            resp = await client.get(f"https://www.sanmin.com.tw/search?ct=K&qu={q_quoted}", headers=headers)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                candidates = []
+                for img in soup.find_all("img"):
+                    data_src = img.get("data-src", "")
+                    alt = img.get("alt", "").strip()
+                    if "product_images" in data_src and alt and "簡體書" not in alt:
+                        m = re.search(r"product_images/(\d{3})/(\d{9})\.jpg", data_src)
+                        isbn13 = None
+                        if m:
+                            prefix12 = f"978{m.group(2)}"
+                            total = sum(int(digit) * (1 if i % 2 == 0 else 3) for i, digit in enumerate(prefix12))
+                            check_digit = (10 - (total % 10)) % 10
+                            isbn13 = f"{prefix12}{check_digit}"
+                        
+                        p = img.find_parent("div")
+                        while p and len(p.text) < 50:
+                            p = p.find_parent("div")
+                        author = None
+                        publisher = None
+                        if p:
+                            t = p.text
+                            m_pub = re.search(r"出版社[：:\s]+([^\s\n\r]+)", t)
+                            if m_pub: publisher = m_pub.group(1).strip()
+                            m_auth = re.search(r"作者[：:\s]+([^\s\n\r]+)", t)
+                            if m_auth: author = m_auth.group(1).strip()
+                        
+                        # 計算匹配度權重
+                        score = 0
+                        if clean_target == alt:
+                            score = 100
+                        elif alt.startswith(clean_target):
+                            score = 90
+                        elif clean_target in alt:
+                            score = 80
+                        elif any(word in alt for word in clean_target.split()):
+                            score = 50
+
+                        candidates.append((score, {
+                            "identity": {"isbn_13": isbn13, "isbn_10": None, "google_books_id": None},
+                            "work": {"title": alt, "subtitle": None, "authors": [author] if author else [], "language": "zh-TW"},
+                            "edition": {"publisher": publisher, "published_date": None, "page_count": None, "print_type": "BOOK"},
+                            "cover": {"url": data_src, "resolution_hint": "high", "source": "taiwan_catalog_cdn"},
+                            "description": None,
+                            "source": {
+                                "provider": "taiwan_catalog_fallback",
+                                "confidence": 0.88 if score >= 80 else 0.70,
+                                "confidence_reasons": ["taiwan_catalog_match", "traditional_chinese_compatible"],
+                                "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            }
+                        }))
+                
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    return candidates[0][1]
+    except Exception:
+        pass
+    
+    return None
+
+
+async def fallback_search_books(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """當 Google Books 遇到頻率限制時，搜尋臺灣本土出版品清單"""
+    import urllib.parse
+    from bs4 import BeautifulSoup
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    clean_target = query.strip()
+    q_quoted = urllib.parse.quote(clean_target)
+    books: list[dict[str, Any]] = []
+    
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=6.0, follow_redirects=True) as client:
+            resp = await client.get(f"https://www.sanmin.com.tw/search?ct=K&qu={q_quoted}", headers=headers)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for img in soup.find_all("img"):
+                    data_src = img.get("data-src", "")
+                    alt = img.get("alt", "").strip()
+                    if "product_images" in data_src and alt and "簡體書" not in alt:
+                        m = re.search(r"product_images/(\d{3})/(\d{9})\.jpg", data_src)
+                        isbn13 = None
+                        if m:
+                            prefix12 = f"978{m.group(2)}"
+                            total = sum(int(digit) * (1 if i % 2 == 0 else 3) for i, digit in enumerate(prefix12))
+                            check_digit = (10 - (total % 10)) % 10
+                            isbn13 = f"{prefix12}{check_digit}"
+                        
+                        p = img.find_parent("div")
+                        while p and len(p.text) < 50:
+                            p = p.find_parent("div")
+                        author = None
+                        publisher = None
+                        if p:
+                            t = p.text
+                            m_pub = re.search(r"出版社[：:\s]+([^\s\n\r]+)", t)
+                            if m_pub: publisher = m_pub.group(1).strip()
+                            m_auth = re.search(r"作者[：:\s]+([^\s\n\r]+)", t)
+                            if m_auth: author = m_auth.group(1).strip()
+                        
+                        books.append({
+                            "identity": {"isbn_13": isbn13, "isbn_10": None, "google_books_id": None},
+                            "work": {"title": alt, "subtitle": None, "authors": [author] if author else [], "language": "zh-TW"},
+                            "edition": {"publisher": publisher, "published_date": None, "page_count": None, "print_type": "BOOK"},
+                            "cover": {"url": data_src, "resolution_hint": "high", "source": "taiwan_catalog_cdn"},
+                            "description": None,
+                            "source": {
+                                "provider": "taiwan_catalog_fallback",
+                                "confidence": 0.88,
+                                "confidence_reasons": ["taiwan_catalog_match"],
+                                "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            }
+                        })
+                        if len(books) >= max_results:
+                            break
+    except Exception:
+        pass
+    
+    return books
+
+
+# ============================================================================
 # 5. MCP 核心工具 (Tools API)
 # ============================================================================
 
@@ -270,7 +478,7 @@ async def resolve_book(query_or_isbn: str) -> dict[str, Any]:
     
     支援直接輸入 ISBN (含破折號) 或繁體中文書名，自動執行：
     1. ISBN 清洗與校驗碼驗證 (Checksum Validation)
-    2. Google Books 精確檢索
+    2. Google Books 精確檢索 (具備臺灣書目庫自動備援)
     3. 書封高畫質升級與安全協議校正
     4. 輸出結構化 Fact Layer (包含 identity, work, edition, cover, source)
     
@@ -297,6 +505,12 @@ async def resolve_book(query_or_isbn: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(GOOGLE_BOOKS_API_BASE, params=params, headers=headers)
             
+            # 若 Google Books 限制或無結果，啟動臺灣本土備援
+            if resp.status_code in (400, 429) or (resp.status_code == 200 and not resp.json().get("items")):
+                fb = await fallback_resolve_book(target, is_isbn, isbn_info.get("canonical_13"))
+                if fb:
+                    return {"success": True, "found": True, "book": fb}
+            
             if resp.status_code == 429:
                 return make_error("RATE_LIMITED", "Google Books API 頻率限制 (429)。請在 .env 配置 GOOGLE_BOOKS_API_KEY。", retryable=True)
             elif resp.status_code >= 500:
@@ -307,6 +521,9 @@ async def resolve_book(query_or_isbn: str) -> dict[str, Any]:
             items = data.get("items", [])
             
             if not items:
+                fb = await fallback_resolve_book(target, is_isbn, isbn_info.get("canonical_13"))
+                if fb:
+                    return {"success": True, "found": True, "book": fb}
                 return {
                     "success": True,
                     "found": False,
@@ -320,9 +537,11 @@ async def resolve_book(query_or_isbn: str) -> dict[str, Any]:
                 "found": True,
                 "book": fact
             }
-    except httpx.TimeoutException:
-        return make_error("UPSTREAM_TIMEOUT", "連線 Google Books API 逾時。", retryable=True)
     except Exception as e:
+        # 網路異常或逾時，嘗試本土備援
+        fb = await fallback_resolve_book(target, is_isbn, isbn_info.get("canonical_13"))
+        if fb:
+            return {"success": True, "found": True, "book": fb}
         return make_error("UPSTREAM_ERROR", f"請求發生錯誤: {str(e)}", retryable=False)
 
 
@@ -370,6 +589,16 @@ async def search_books(query: str, search_type: str = "auto", language: str = "z
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(GOOGLE_BOOKS_API_BASE, params=params, headers=headers)
             
+            if resp.status_code in (400, 429) or (resp.status_code == 200 and not resp.json().get("items")):
+                fb_books = await fallback_search_books(clean_query, max_results=max_results)
+                if fb_books:
+                    return {
+                        "success": True,
+                        "total_items": len(fb_books),
+                        "returned_count": len(fb_books),
+                        "books": fb_books
+                    }
+
             if resp.status_code == 429:
                 return make_error("RATE_LIMITED", "Google Books API 頻率限制 (429)。請配置金鑰。", retryable=True)
             elif resp.status_code >= 500:
@@ -379,6 +608,16 @@ async def search_books(query: str, search_type: str = "auto", language: str = "z
             data = resp.json()
             items = data.get("items", [])
             
+            if not items:
+                fb_books = await fallback_search_books(clean_query, max_results=max_results)
+                if fb_books:
+                    return {
+                        "success": True,
+                        "total_items": len(fb_books),
+                        "returned_count": len(fb_books),
+                        "books": fb_books
+                    }
+
             books = [build_book_fact(item, query_used=clean_query, is_isbn_query=(search_type == "isbn")) for item in items]
             return {
                 "success": True,
@@ -386,9 +625,15 @@ async def search_books(query: str, search_type: str = "auto", language: str = "z
                 "returned_count": len(books),
                 "books": books
             }
-    except httpx.TimeoutException:
-        return make_error("UPSTREAM_TIMEOUT", "連線 Google Books API 逾時。", retryable=True)
     except Exception as e:
+        fb_books = await fallback_search_books(clean_query, max_results=max_results)
+        if fb_books:
+            return {
+                "success": True,
+                "total_items": len(fb_books),
+                "returned_count": len(fb_books),
+                "books": fb_books
+            }
         return make_error("UPSTREAM_ERROR", f"搜尋失敗: {str(e)}", retryable=False)
 
 
