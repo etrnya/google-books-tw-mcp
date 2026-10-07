@@ -1,0 +1,24 @@
+[project]
+name = "google-books-tw-mcp"
+version = "1.0.0"
+description = "針對臺灣繁體出版品、ISBN 破折號自動清洗、高畫質書封解析的專用 Google Books MCP 伺服器"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "etrnya" }
+]
+keywords = ["mcp", "google-books", "taiwan", "traditional-chinese", "isbn", "reading", "notion"]
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0"
+]
+
+[project.scripts]
+google-books-tw-mcp = "server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
