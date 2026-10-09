@@ -19,6 +19,11 @@ from server import (
     resolve_highres_cover,
     build_book_fact,
     make_error,
+    get_taiwan_isbn_cover,
+    resolve_tenlong_book,
+    resolve_sanmin_book,
+    fallback_resolve_book,
+    fallback_search_books,
 )
 
 
@@ -160,11 +165,15 @@ class TestGoogleBooksTWResolver(unittest.TestCase):
         # 2. 書目基本資訊驗證
         self.assertEqual(fact["work"]["title"], "原子習慣")
         self.assertEqual(fact["work"]["authors"], ["James Clear"])
+        self.assertEqual(fact["work"]["translators"], [])
         self.assertEqual(fact["work"]["language"], "zh-TW")
 
         # 3. 出版版本資訊驗證
         self.assertEqual(fact["edition"]["publisher"], "方智")
         self.assertEqual(fact["edition"]["published_date"], "2019-06-01")
+        self.assertIsNone(fact["edition"]["binding"])
+        self.assertIsNone(fact["edition"]["price"])
+        self.assertIsNone(fact["edition"]["category"])
 
         # 4. 書封事實驗證
         self.assertTrue(fact["cover"]["url"].startswith("https://"))
@@ -191,6 +200,77 @@ class TestGoogleBooksTWResolver(unittest.TestCase):
 
         err_fatal = make_error("INVALID_ISBN", "書號格式不符", retryable=False)
         self.assertFalse(err_fatal["retryable"])
+
+    # ========================================================================
+    # 6. 臺灣 CDN 原圖映射測試 (100% 離線可用)
+    # ========================================================================
+    def test_get_taiwan_isbn_cover(self):
+        # 13 碼臺灣書號正確映射至三民 CDN
+        url = get_taiwan_isbn_cover("9789861755267")
+        self.assertEqual(url, "https://cdnec.sanmin.com.tw/product_images/986/986175526.jpg")
+
+        # 非 13 碼或非 978 開頭回傳 None
+        self.assertIsNone(get_taiwan_isbn_cover("12345"))
+        self.assertIsNone(get_taiwan_isbn_cover(None))
+
+
+class TestCascadingFallbackAsync(unittest.IsolatedAsyncioTestCase):
+
+    # ========================================================================
+    # 7. 天瓏網路書店解析器 (Tenlong Resolver) 實測
+    # ========================================================================
+    async def test_resolve_tenlong_book(self):
+        # 查詢技術與暢銷書籍《原子習慣》
+        res = await resolve_tenlong_book("9789861755267", is_isbn=True, canonical_13="9789861755267")
+        self.assertIsNotNone(res)
+        self.assertEqual(res["identity"]["isbn_13"], "9789861755267")
+        self.assertIn("原子習慣", res["work"]["title"])
+        self.assertTrue(len(res["work"]["authors"]) > 0)
+        self.assertIn("蔡世偉", res["work"]["translators"])
+        self.assertEqual(res["edition"]["publisher"], "方智")
+        self.assertEqual(res["edition"]["binding"], "平裝")
+        self.assertEqual(res["edition"]["price"], 330)
+        self.assertEqual(res["source"]["provider"], "tenlong")
+        self.assertTrue(res["cover"]["url"].startswith("https://"))
+        self.assertIn("/original/", res["cover"]["url"])
+
+    # ========================================================================
+    # 8. 三民網路書店解析器 (Sanmin Resolver & Schema.org) 實測
+    # ========================================================================
+    async def test_resolve_sanmin_book(self):
+        # 查詢一般暢銷書《富人不說，卻默默在做的33件事》
+        res = await resolve_sanmin_book("9789861343761", is_isbn=True, canonical_13="9789861343761")
+        self.assertIsNotNone(res)
+        self.assertEqual(res["identity"]["isbn_13"], "9789861343761")
+        self.assertIn("富人不說", res["work"]["title"])
+        self.assertEqual(res["edition"]["publisher"], "先覺")
+        self.assertEqual(res["edition"]["binding"], "平裝")
+        self.assertEqual(res["source"]["provider"], "sanmin")
+        self.assertIn("schema_org_validated", res["source"]["confidence_reasons"])
+        self.assertTrue(res["cover"]["url"].startswith("https://"))
+
+    # ========================================================================
+    # 9. 多來源級聯備援中樞 (Cascading Fallback Orchestrator) 實測
+    # ========================================================================
+    async def test_fallback_resolve_book_cascading(self):
+        # 測試天瓏優先命中
+        res_tl = await fallback_resolve_book("9789861755267", is_isbn=True, canonical_13="9789861755267")
+        self.assertIsNotNone(res_tl)
+        self.assertEqual(res_tl["identity"]["isbn_13"], "9789861755267")
+        self.assertEqual(res_tl["source"]["provider"], "tenlong")
+
+        # 測試三民命中 (非天瓏收錄書籍)
+        res_sm = await fallback_resolve_book("9789861343761", is_isbn=True, canonical_13="9789861343761")
+        self.assertIsNotNone(res_sm)
+        self.assertEqual(res_sm["source"]["provider"], "sanmin")
+
+    # ========================================================================
+    # 10. 級聯搜尋功能 (fallback_search_books) 實測
+    # ========================================================================
+    async def test_fallback_search_books(self):
+        books = await fallback_search_books("原子習慣", max_results=3)
+        self.assertTrue(len(books) > 0)
+        self.assertTrue(any("原子習慣" in b["work"]["title"] for b in books))
 
 
 if __name__ == "__main__":
